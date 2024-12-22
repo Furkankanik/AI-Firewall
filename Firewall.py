@@ -14,13 +14,14 @@ import socket
 import sys
 import pydivert
 
-
+# Loglama işlemleri için temel ayarlar
 logging.basicConfig(
     filename="firewall_logs.txt",
     level=logging.INFO,
     format="%(asctime)s - %(levelname)s - %(message)s"
 )
 
+# Logları dosyaya yazan fonksiyon
 def log_to_file(message, level="info"):
     if level == "info":
         logging.info(message)
@@ -29,10 +30,12 @@ def log_to_file(message, level="info"):
     elif level == "error":
         logging.error(message)
 
+# Firewall işlevini çalıştıracak işçi thread sınıfı
 class firewallWorker(QThread):
-    log_signal = pyqtSignal(str, str, str)
-    rules_Signal = pyqtSignal(str)
+    log_signal = pyqtSignal(str, str, str)  # Ağ trafiği logunu GUI'ye gönderen sinyal
+    rules_Signal = pyqtSignal(str)  # Kural bloklamalarını GUI'ye gönderen sinyal
 
+    # Protokolleri insan tarafından okunabilir isimlere dönüştüren harita
     PROTOCOL_MAP = {
         1: "ICMP", 2: "IGMP", 6: "TCP", 8: "EGP", 9: "IGP", 17: "UDP",
         41: "IPv6", 50: "ESP (Encapsulation Security Payload)", 51: "AH(Authentication Header)",
@@ -40,19 +43,20 @@ class firewallWorker(QThread):
         112: "VRRP (Virtual Router Redundancy Protocol)", 137: "MPLS-in-IP", 143: "ETHER-IP", 255: "Experimental(Reserved)"
     }
 
+    # Firewall işçi sınıfının başlatıcısı
     def __init__(self, rules, website_filter, log_area):
         super().__init__()
-        
-        self.rules = rules
-        self.website_filter = website_filter
-        self.log_area = log_area
-        self.running = True
-        self.traffic_tracker = defaultdict(list)
-        self.blacklist = set()
-        self.whitelist = ["127.0.0.1", "::1"]
-        self.ip_cache = {}
-        self.model = self.train_ai_model()
+        self.rules = rules  # Kullanıcının girdiği firewall kuralları
+        self.website_filter = website_filter  # Engellenmesi gereken web siteleri
+        self.log_area = log_area  # Logların yazılacağı alan (GUI)
+        self.running = True  # Firewall'un çalışıp çalışmadığını kontrol eden bayrak
+        self.traffic_tracker = defaultdict(list)  # Trafik izleyicisi
+        self.blacklist = set()  # Kara listeye alınan IP'ler
+        self.whitelist = ["127.0.0.1", "::1"]  # Beyaz listeye alınan IP'ler
+        self.ip_cache = {}  # URL-İP çözümlemesi için önbellek
+        self.model = self.train_ai_model()  # AI modelini eğit
 
+    # Basit bir AI modelini eğitmek için örnek veri seti
     def train_ai_model(self):
         data = [ 
             [10,15,6],
@@ -64,23 +68,27 @@ class firewallWorker(QThread):
         ]
         labels = [0,1,0,1,0,1]
 
+        # Veriyi eğitim ve test verilerine ayır
         X_train, X_test, y_train, y_test = train_test_split(data, labels, test_size=0.3, random_state=42)
 
-        model = RandomForestClassifier(n_estimators=100, random_state=42)
-        model.fit(X_train, y_train)
+        model = RandomForestClassifier(n_estimators=100, random_state=42)  # Modeli oluştur
+        model.fit(X_train, y_train)  # Modeli eğit
 
+        # Test verisiyle doğruluğu kontrol et
         y_pred = model.predict(X_test)
         accuracy = accuracy_score(y_test, y_pred)
         log_to_file(f"AI Model doğruluğu: {accuracy * 100:.2f}%", level="info")
 
-        joblib.dump(model, "ai_firewall_model.pkl")
+        joblib.dump(model, "ai_firewall_model.pkl")  # Eğitilen modeli dosyaya kaydet
         log_to_file("AI Model başarıyla kaydedildi.", level="info")
         return model
 
+    # Ağ trafiğini analiz etme (AI modelini kullanarak)
     def analyze_traffic(self, features):
         prediction = self.model.predict([features])[0]
         return prediction
 
+    # URL'yi IP adresine dönüştür
     def resolve_url_to_ip(self, url):
         if url in self.ip_cache:
             return self.ip_cache[url]
@@ -91,53 +99,60 @@ class firewallWorker(QThread):
         except socket.gaierror:
             return None
 
+    # Protokolü isme dönüştür
     def get_protocol_name(self, protocol):
         if isinstance(protocol, tuple):
             protocol = protocol[0]
         return self.PROTOCOL_MAP.get(protocol, f"Unknown({protocol})")
 
+    # Firewall işçisinin çalıştırıldığı fonksiyon
     def run(self):
         try:
-            with pydivert.WinDivert("tcp or udp") as w:
+            with pydivert.WinDivert("tcp or udp") as w:  # pydivert ile ağ trafiği yakala
                 for packet in w:
                     if not self.running:
                         break
 
-                    src_ip = packet.src_addr
-                    dst_ip = packet.dst_addr
-                    protocol = self.get_protocol_name(packet.protocol)
-                    current_time = time.time()
+                    src_ip = packet.src_addr  # Kaynak IP adresi
+                    dst_ip = packet.dst_addr  # Hedef IP adresi
+                    protocol = self.get_protocol_name(packet.protocol)  # Protokol ismi
+                    current_time = time.time()  # Şu anki zaman
 
+                    # Beyaz listede ise, paketi göndermeye devam et
                     if src_ip in self.whitelist:
                         w.send(packet)
                         continue
+                    # Kara listede ise, paketi engelle
                     if src_ip in self.blacklist:
                         self.rules_Signal.emit(f"IP in blacklist: {src_ip}")
                         continue
                     
-                    
+                    # Hedef URL web sitesi filtrede ise, paketi engelle
                     resolved_ip = self.resolve_url_to_ip(dst_ip)
                     if resolved_ip and resolved_ip in self.website_filter:
                         self.rules_Signal.emit(f"Blocked: {dst_ip} (website)")
                         log_to_file(f"Blocked website: {dst_ip}", level="warning")
                         continue
 
+                    # Trafik penceresindeki zaman izleyicisini güncelle
                     self.traffic_tracker[src_ip].append(current_time)
                     short_window = [ts for ts in self.traffic_tracker[src_ip] if current_time - ts <= 1]
                     long_window = [ts for ts in self.traffic_tracker[src_ip] if current_time - ts <= 10]
                     short_count = len(short_window)
                     long_count = len(long_window)
 
+                    # DDOS saldırısı tespiti
                     if short_count > 10000 or long_count > 50000:
                         self.rules_Signal.emit(f"DDOS Detected: {src_ip} short_count={short_count}, long_count={long_count}")
                         self.blacklist.add(src_ip)
                         log_to_file(f"DDOS Detected and Blocked: {src_ip}", level="warning")
                         continue
 
-                    self.log_signal.emit(src_ip, dst_ip, protocol)
-                    log_to_file(f"Packet: {src_ip}:{packet.src_port} -> {dst_ip}:{packet.dst_port}")
+                    self.log_signal.emit(src_ip, dst_ip, protocol)  # Trafiği GUI'ye gönder
+                    log_to_file(f"Packet: {src_ip}:{packet.src_port} -> {dst_ip}:{packet.dst_port}")  # Paket logu yaz
 
                     blocked = False
+                    # Kullanıcının belirlediği kuralları kontrol et ve uygula
                     for rule in self.rules:
                         if "tcp" in rule and protocol.lower() == "tcp":
                             self.rules_Signal.emit("TCP Packet Blocked.")
@@ -153,31 +168,34 @@ class firewallWorker(QThread):
                             blocked = True
                             break
 
+                    # Eğer kural yoksa, paketi göndermeye devam et
                     if not blocked:
                         w.send(packet)
 
         except Exception as e:
-            self.rules_Signal.emit(f"Error: {str(e)}")
+            self.rules_Signal.emit(f"Error: {str(e)}")  # Hata mesajını GUI'ye ilet
 
-
+    # Firewall'u durdur
     def stop(self):
         self.running = False
 
+# GUI kısmı (PyQt5)
 class firewallGui(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.rules_Signal = pyqtSignal(str)
-        self.setWindowTitle("Türk Güvenlik Ağ Analiz Sistemi")
-        self.setWindowIcon(QIcon("Güvenlik-Sistemi.ico"))
-        self.tema()
+        self.rules_Signal = pyqtSignal(str)  # Kurallar ile ilgili sinyal
+        self.setWindowTitle("Türk Güvenlik Ağ Analiz Sistemi")  # Pencere başlığı
+        self.setWindowIcon(QIcon("Güvenlik-Sistemi.ico"))  # Pencere simgesi
+        self.tema()  # GUI temasını uygula
         screen = QApplication.primaryScreen()
         screen_size = screen.availableGeometry()
-        self.resize(screen_size.width() // 2, screen_size.height() // 2)
+        self.resize(screen_size.width() // 2, screen_size.height() // 2)  # Pencere boyutunu ayarla
 
         self.main_widget = QWidget()
         self.setCentralWidget(self.main_widget)
         layout = QVBoxLayout()
 
+        # Button ve etiketler için GUI elemanları
         self.start_button = QPushButton("Firewall Başlat")
         self.start_button.clicked.connect(self.start_firewall)
         self.stop_button = QPushButton("Firewall Durdur")
@@ -241,74 +259,79 @@ class firewallGui(QMainWindow):
         self.main_widget.setLayout(layout)
 
         self.firewall_worker = None
-        self.rules = []
-        self.website_filter = set()
+        self.rules = []  # Kullanıcı tarafından belirlenen firewall kuralları
+        self.website_filter = set()  # Engellenen web siteleri
 
+    # Trafik tablosuna yeni satır ekleme
     def add_to_traffic_table(self, src, dst, protocol):
-        if self.log_area.rowCount() > 1000:
+        if self.log_area.rowCount() > 1000:  # Satır sayısı çok fazlaysa temizle
             self.log_area.clearContents()  
-        row_position = self.log_area.rowCount()  
-        self.log_area.insertRow(row_position)  
-        self.log_area.setItem(row_position, 0, QTableWidgetItem(src))  
-        self.log_area.setItem(row_position, 1, QTableWidgetItem(dst))  
-        self.log_area.setItem(row_position, 2, QTableWidgetItem(protocol))  
+        row_position = self.log_area.rowCount()  # Yeni satırın eklenme pozisyonu
+        self.log_area.insertRow(row_position)  # Yeni satır ekle
+        self.log_area.setItem(row_position, 0, QTableWidgetItem(src))  # Kaynak IP
+        self.log_area.setItem(row_position, 1, QTableWidgetItem(dst))  # Hedef IP
+        self.log_area.setItem(row_position, 2, QTableWidgetItem(protocol))  # Protokol
 
+    # Yeni kural ekle
     def add_rule(self):
         rule = self.rule_input.text()
-        if not rule:
+        if not rule:  # Kural boş olamaz
             QMessageBox.warning(self, "Uyarı", "Geçerli Bir Kural Girin!")
             return
-        self.rules.append(rule)
-        self.rule_list.addItem(rule)
+        self.rules.append(rule)  # Kuralı listeye ekle
+        self.rule_list.addItem(rule)  # Kuralı listeye ekle
         self.rule_input.clear()
 
+    # Seçilen kuralı sil
     def delete_rule(self):
         selected_items = self.rule_list.selectedItems()
         if not selected_items:
             return
         for item in selected_items:
             rule = item.text()
-            self.rules.remove(rule)
-            self.rule_list.takeItem(self.rule_list.row(item))
+            self.rules.remove(rule)  # Kuralı listeden çıkar
+            self.rule_list.takeItem(self.rule_list.row(item))  # Listeden çıkar
 
+    # Web sitesi ekle
     def add_Website(self):
         website = self.website_input.text()
         if website:
-            self.website_filter.add(website)
-            self.blocker_list.addItem(website)
+            self.website_filter.add(website)  # Engellenen web sitesi listesine ekle
+            self.blocker_list.addItem(website)  # Engellenen web sitesi GUI'ye ekle
             self.website_input.clear()
 
+    # Web sitesini sil
     def delete_WebSite(self):
         selected_items = self.blocker_list.selectedItems()
         if not selected_items:
             return
         for item in selected_items:
             website = item.text()
-            self.website_filter.remove(website)
-            self.blocker_list.takeItem(self.blocker_list.row(item))
+            self.website_filter.remove(website)  # Web sitesini engellenenlerden çıkar
+            self.blocker_list.takeItem(self.blocker_list.row(item))  # GUI'den çıkar
 
+    # Firewall'u başlat
     def start_firewall(self):
         self.firewall_worker = firewallWorker(self.rules, self.website_filter,self.log_area)
         
-        self.firewall_worker.log_signal.connect(self.add_to_traffic_table)
-        self.firewall_worker.rules_Signal.connect(self.rules_area.append)
-        self.firewall_worker.start()
+        self.firewall_worker.log_signal.connect(self.add_to_traffic_table)  # Trafiği GUI'ye aktar
+        self.firewall_worker.rules_Signal.connect(self.rules_area.append)  # Kuralları GUI'ye aktar
+        self.firewall_worker.start()  # İşçiyi başlat
         self.add_to_traffic_table("Firewall", "Başlatıldı", "AI Model Eğitim Tamamlandı")
 
+        self.start_button.setEnabled(False)  # Başlat butonunu devre dışı bırak
+        self.stop_button.setEnabled(True)   # Durdur butonunu etkinleştir
 
-
-        self.start_button.setEnabled(False)
-        self.stop_button.setEnabled(True)
-        
-
+    # Firewall'u durdur
     def stop_firewall(self):
         if self.firewall_worker:
-            self.firewall_worker.stop()
-            self.firewall_worker.wait()
+            self.firewall_worker.stop()  # İşçiyi durdur
+            self.firewall_worker.wait()  # İşçiyi bekle
 
-        self.start_button.setEnabled(True)
-        self.stop_button.setEnabled(False)
+        self.start_button.setEnabled(True)  # Başlat butonunu etkinleştir
+        self.stop_button.setEnabled(False)  # Durdur butonunu devre dışı bırak
 
+    # GUI temasını belirle
     def tema(self):
         style_sheet = """
             QWidget {
@@ -361,8 +384,9 @@ class firewallGui(QMainWindow):
         """
         self.setStyleSheet(style_sheet)
 
+# Ana uygulama başlatıcı
 if __name__ == '__main__':
     app = QApplication(sys.argv)
-    window = firewallGui()
-    window.show()
-    sys.exit(app.exec_())
+    window = firewallGui()  # GUI'yi başlat
+    window.show()  # GUI'yi göster
+    sys.exit(app.exec_())  # Uygulamayı başlat
