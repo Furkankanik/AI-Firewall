@@ -1,4 +1,0 @@
-pip install pyqt5
-pip install scikit-learn
-pip install pydivert
-pip install joblib
